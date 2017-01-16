@@ -1,10 +1,9 @@
 /* -*- coding: utf-8 -*-
  * ----------------------------------------------------------------------
- * Copyright © 2011-2013, RedJack, LLC.
+ * Copyright © 2011-2015, RedJack, LLC.
  * All rights reserved.
  *
- * Please see the COPYING file in this distribution for license
- * details.
+ * Please see the COPYING file in this distribution for license details.
  * ----------------------------------------------------------------------
  */
 
@@ -26,6 +25,11 @@
 
 #else
 /* Otherwise autodetect! */
+
+
+/**** VERSION ****/
+
+#include <libcork/config/version.h>
 
 
 /**** ARCHITECTURES ****/
@@ -55,6 +59,10 @@
 #elif defined(__MINGW32__)
 /* Do some mingw32 autodetection. */
 #include <libcork/config/mingw32.h>
+
+#elif defined(__sun)
+/* Do some Solaris autodetection. */
+#include <libcork/config/solaris.h>
 
 #endif  /* platforms */
 

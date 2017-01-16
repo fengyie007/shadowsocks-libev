@@ -1,7 +1,7 @@
 /*
  * encrypt.h - Define the enryptor's interface
  *
- * Copyright (C) 2013 - 2015, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2016, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -105,12 +105,18 @@ typedef struct {
 #endif
 
 typedef struct {
-    cipher_evp_t evp;
+    cipher_evp_t *evp;
 #ifdef USE_CRYPTO_APPLECC
     cipher_cc_t cc;
 #endif
     uint8_t iv[MAX_IV_LENGTH];
 } cipher_ctx_t;
+
+typedef struct {
+    cipher_kt_t *info;
+    size_t iv_len;
+    size_t key_len;
+} cipher_t;
 
 #ifdef HAVE_STDINT_H
 #include <stdint.h>
@@ -119,7 +125,7 @@ typedef struct {
 #endif
 
 #define SODIUM_BLOCK_SIZE   64
-#define CIPHER_NUM          17
+#define CIPHER_NUM          21
 
 #define NONE                -1
 #define TABLE               0
@@ -128,37 +134,73 @@ typedef struct {
 #define AES_128_CFB         3
 #define AES_192_CFB         4
 #define AES_256_CFB         5
-#define BF_CFB              6
-#define CAMELLIA_128_CFB    7
-#define CAMELLIA_192_CFB    8
-#define CAMELLIA_256_CFB    9
-#define CAST5_CFB           10
-#define DES_CFB             11
-#define IDEA_CFB            12
-#define RC2_CFB             13
-#define SEED_CFB            14
-#define SALSA20             15
-#define CHACHA20            16
+#define AES_128_CTR         6
+#define AES_192_CTR         7
+#define AES_256_CTR         8
+#define BF_CFB              9
+#define CAMELLIA_128_CFB    10
+#define CAMELLIA_192_CFB    11
+#define CAMELLIA_256_CFB    12
+#define CAST5_CFB           13
+#define DES_CFB             14
+#define IDEA_CFB            15
+#define RC2_CFB             16
+#define SEED_CFB            17
+#define SALSA20             18
+#define CHACHA20            19
+#define CHACHA20IETF        20
+
+#define ONETIMEAUTH_FLAG 0x10
+#define ADDRTYPE_MASK 0xEF
+
+#define ONETIMEAUTH_BYTES 10U
+#define CLEN_BYTES 2U
+#define AUTH_BYTES (ONETIMEAUTH_BYTES + CLEN_BYTES)
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #define max(a, b) (((a) > (b)) ? (a) : (b))
 
-struct enc_ctx {
+typedef struct buffer {
+    size_t idx;
+    size_t len;
+    size_t capacity;
+    char   *data;
+} buffer_t;
+
+typedef struct chunk {
+    uint32_t idx;
+    uint32_t len;
+    uint32_t counter;
+    buffer_t *buf;
+} chunk_t;
+
+typedef struct enc_ctx {
     uint8_t init;
     uint64_t counter;
     cipher_ctx_t evp;
-};
+} enc_ctx_t;
 
-char * ss_encrypt_all(int buf_size, char *plaintext, ssize_t *len, int method);
-char * ss_decrypt_all(int buf_size, char *ciphertext, ssize_t *len, int method);
-char * ss_encrypt(int buf_size, char *plaintext, ssize_t *len,
-                  struct enc_ctx *ctx);
-char * ss_decrypt(int buf_size, char *ciphertext, ssize_t *len,
-                  struct enc_ctx *ctx);
-void enc_ctx_init(int method, struct enc_ctx *ctx, int enc);
+int ss_encrypt_all(buffer_t *plaintext, int method, int auth, size_t capacity);
+int ss_decrypt_all(buffer_t *ciphertext, int method, int auth, size_t capacity);
+int ss_encrypt(buffer_t *plaintext, enc_ctx_t *ctx, size_t capacity);
+int ss_decrypt(buffer_t *ciphertext, enc_ctx_t *ctx, size_t capacity);
+
+void enc_ctx_init(int method, enc_ctx_t *ctx, int enc);
 int enc_init(const char *pass, const char *method);
 int enc_get_iv_len(void);
 void cipher_context_release(cipher_ctx_t *evp);
 unsigned char *enc_md5(const unsigned char *d, size_t n, unsigned char *md);
+
+int ss_onetimeauth(buffer_t *buf, uint8_t *iv, size_t capacity);
+int ss_onetimeauth_verify(buffer_t *buf, uint8_t *iv);
+
+int ss_check_hash(buffer_t *buf, chunk_t *chunk, enc_ctx_t *ctx, size_t capacity);
+int ss_gen_hash(buffer_t *buf, uint32_t *counter, enc_ctx_t *ctx, size_t capacity);
+
+int balloc(buffer_t *ptr, size_t capacity);
+int brealloc(buffer_t *ptr, size_t len, size_t capacity);
+void bfree(buffer_t *ptr);
+
+int rand_bytes(void *output, int len);
 
 #endif // _ENCRYPT_H

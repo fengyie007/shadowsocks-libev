@@ -1,7 +1,7 @@
 /*
  * utils.h - Misc utilities
  *
- * Copyright (C) 2013 - 2015, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2016, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -20,9 +20,26 @@
  * <http://www.gnu.org/licenses/>.
  */
 
+#if defined(USE_CRYPTO_OPENSSL)
+
+#include <openssl/opensslv.h>
+#define USING_CRYPTO OPENSSL_VERSION_TEXT
+
+#elif defined(USE_CRYPTO_POLARSSL)
+#include <polarssl/version.h>
+#define USING_CRYPTO POLARSSL_VERSION_STRING_FULL
+
+#elif defined(USE_CRYPTO_MBEDTLS)
+#include <mbedtls/version.h>
+#define USING_CRYPTO MBEDTLS_VERSION_STRING_FULL
+
+#endif
+
 #ifndef _UTILS_H
 #define _UTILS_H
 
+#include <stddef.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -44,12 +61,12 @@
 
 #else
 
-#define STR(x) #x
+#define STR(x) # x
 #define TOSTR(x) STR(x)
 
 #ifdef LIB_ONLY
 
-extern FILE * logfile;
+extern FILE *logfile;
 
 #define TIME_FORMAT "%Y-%m-%d %H:%M:%S"
 
@@ -149,7 +166,7 @@ extern int use_syslog;
                 fprintf(stderr, "\e[01;32m %s INFO: \e[0m" format "\n", timestr, \
                         ## __VA_ARGS__);                                         \
             } else {                                                             \
-                fprintf(stderr, "%s INFO: " format "\n", timestr,                \
+                fprintf(stderr, " %s INFO: " format "\n", timestr,               \
                         ## __VA_ARGS__);                                         \
             }                                                                    \
         }                                                                        \
@@ -193,13 +210,23 @@ void ERROR(const char *s);
 #endif
 
 char *ss_itoa(int i);
+int ss_isnumeric(const char *s);
 int run_as(const char *user);
 void FATAL(const char *msg);
 void usage(void);
-void daemonize(const char * path);
+void daemonize(const char *path);
 char *ss_strndup(const char *s, size_t n);
 #ifdef HAVE_SETRLIMIT
 int set_nofile(int nofile);
 #endif
+
+void *ss_malloc(size_t size);
+void *ss_realloc(void *ptr, size_t new_size);
+
+#define ss_free(ptr)     \
+    do {                 \
+        free(ptr);       \
+        ptr = NULL;      \
+    } while (0)
 
 #endif // _UTILS_H
