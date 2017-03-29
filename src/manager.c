@@ -1,7 +1,7 @@
 /*
  * server.c - Provide shadowsocks service
  *
- * Copyright (C) 2013 - 2016, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2017, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -39,7 +39,6 @@
 #include <limits.h>
 #include <dirent.h>
 
-#ifndef __MINGW32__
 #include <netdb.h>
 #include <errno.h>
 #include <arpa/inet.h>
@@ -49,13 +48,7 @@
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <pwd.h>
-#endif
-
 #include <libcork/core.h>
-
-#ifdef __MINGW32__
-#include "win32.h"
-#endif
 
 #if defined(HAVE_SYS_IOCTL_H) && defined(HAVE_NET_IF_H) && defined(__linux__)
 #include <net/if.h>
@@ -80,7 +73,6 @@ int working_dir_size = 0;
 static struct cork_hash_table *server_table;
 static struct cork_hash_table *sock_table;
 
-#ifndef __MINGW32__
 static int
 setnonblocking(int fd)
 {
@@ -91,7 +83,14 @@ setnonblocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-#endif
+static void
+destroy_server(struct server *server) {
+// function used to free memories alloced in **get_server**
+    if (server->method) ss_free(server->method);
+    if (server->plugin) ss_free(server->plugin);
+    if (server->plugin_opts) ss_free(server->plugin_opts);
+    if (server->mode) ss_free(server->mode);
+}
 
 static void
 build_config(char *prefix, struct server *server)
@@ -112,6 +111,11 @@ build_config(char *prefix, struct server *server)
     fprintf(f, "{\n");
     fprintf(f, "\"server_port\":\"%s\",\n", server->port);
     fprintf(f, "\"password\":\"%s\",\n", server->password);
+    if (server->fast_open[0]) fprintf(f, "\"fast_open\": %s,\n", server->fast_open);
+    if (server->mode)   fprintf(f, "\"mode\":\"%s\",\n", server->mode);
+    if (server->method) fprintf(f, "\"method\":\"%s\",\n", server->method);
+    if (server->plugin) fprintf(f, "\"plugin\":\"%s\",\n", server->plugin);
+    if (server->plugin_opts) fprintf(f, "\"plugin_opts\":\"%s\",\n", server->plugin_opts);
     fprintf(f, "}\n");
     fclose(f);
     ss_free(path);
@@ -121,14 +125,16 @@ static char *
 construct_command_line(struct manager_ctx *manager, struct server *server)
 {
     static char cmd[BUF_SIZE];
+    char *method = manager->method;
     int i;
 
     build_config(working_dir, server);
 
+    if (server->method) method = server->method;
     memset(cmd, 0, BUF_SIZE);
     snprintf(cmd, BUF_SIZE,
              "%s -m %s --manager-address %s -f %s/.shadowsocks_%s.pid -c %s/.shadowsocks_%s.conf",
-             executable, manager->method, manager->manager_address,
+             executable, method, manager->manager_address,
              working_dir, server->port, working_dir, server->port);
 
     if (manager->acl != NULL) {
@@ -153,19 +159,15 @@ construct_command_line(struct manager_ctx *manager, struct server *server)
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -v");
     }
-    if (manager->mode == UDP_ONLY) {
+    if (server->mode == NULL && manager->mode == UDP_ONLY) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -U");
     }
-    if (manager->mode == TCP_AND_UDP) {
+    if (server->mode == NULL && manager->mode == TCP_AND_UDP) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -u");
     }
-    if (manager->auth) {
-        int len = strlen(cmd);
-        snprintf(cmd + len, BUF_SIZE - len, " -A");
-    }
-    if (manager->fast_open) {
+    if (server->fast_open[0] == 0 && manager->fast_open) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --fast-open");
     }
@@ -177,11 +179,11 @@ construct_command_line(struct manager_ctx *manager, struct server *server)
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --mtu %d", manager->mtu);
     }
-    if (manager->plugin) {
+    if (server->plugin == NULL && manager->plugin) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --plugin \"%s\"", manager->plugin);
     }
-    if (manager->plugin_opts) {
+    if (server->plugin_opts == NULL && manager->plugin_opts) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " --plugin-opts \"%s\"", manager->plugin_opts);
     }
@@ -192,6 +194,11 @@ construct_command_line(struct manager_ctx *manager, struct server *server)
     for (i = 0; i < manager->host_num; i++) {
         int len = strlen(cmd);
         snprintf(cmd + len, BUF_SIZE - len, " -s %s", manager->hosts[i]);
+    }
+    // Always enable reuse port
+    {
+        int len = strlen(cmd);
+        snprintf(cmd + len, BUF_SIZE - len, " --reuse-port");
     }
 
     if (verbose) {
@@ -207,7 +214,7 @@ get_data(char *buf, int len)
     char *data;
     int pos = 0;
 
-    while (buf[pos] != '{' && pos < len)
+    while (pos < len && buf[pos] != '{')
         pos++;
     if (pos == len) {
         return NULL;
@@ -223,14 +230,14 @@ get_action(char *buf, int len)
     char *action;
     int pos = 0;
 
-    while (isspace((unsigned char)buf[pos]) && pos < len)
+    while (pos < len && isspace((unsigned char)buf[pos]))
         pos++;
     if (pos == len) {
         return NULL;
     }
     action = buf + pos;
 
-    while ((!isspace((unsigned char)buf[pos]) && buf[pos] != ':') && pos < len)
+    while (pos < len && (!isspace((unsigned char)buf[pos]) && buf[pos] != ':'))
         pos++;
     buf[pos] = '\0';
 
@@ -272,6 +279,26 @@ get_server(char *buf, int len)
             } else if (strcmp(name, "password") == 0) {
                 if (value->type == json_string) {
                     strncpy(server->password, value->u.string.ptr, 128);
+                }
+            } else if (strcmp(name, "method") == 0) {
+                if (value->type == json_string) {
+                    server->method = strdup(value->u.string.ptr);
+                }
+            } else if (strcmp(name, "fast_open") == 0) {
+                if (value->type == json_boolean) {
+                    strncpy(server->fast_open, (value->u.boolean ? "true" : "false"), 8);
+                }
+            } else if (strcmp(name, "plugin") == 0) {
+                if (value->type == json_string) {
+                    server->plugin = strdup(value->u.string.ptr);
+                }
+            } else if (strcmp(name, "plugin_opts") == 0) {
+                if (value->type == json_string) {
+                    server->plugin_opts = strdup(value->u.string.ptr);
+                }
+            } else if (strcmp(name, "mode") == 0) {
+                if (value->type == json_string) {
+                    server->mode = strdup(value->u.string.ptr);
                 }
             } else {
                 LOGE("invalid data: %s", data);
@@ -323,7 +350,7 @@ create_and_bind(const char *host, const char *port, int protocol)
 {
     struct addrinfo hints;
     struct addrinfo *result, *rp, *ipv4v6bindall;
-    int s, listen_sock = -1, is_port_reuse = 0;
+    int s, listen_sock = -1, is_reuse_port = 0;
 
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family   = AF_UNSPEC;                  /* Return IPv4 and IPv6 choices */
@@ -382,14 +409,14 @@ create_and_bind(const char *host, const char *port, int protocol)
             if (verbose) {
                 LOGI("%s port reuse enabled", protocol == IPPROTO_TCP ? "tcp" : "udp");
             }
-            is_port_reuse = 1;
+            is_reuse_port = 1;
         }
 
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
         if (s == 0) {
             /* We managed to bind successfully! */
 
-            if (!is_port_reuse) {
+            if (!is_reuse_port) {
                 if (verbose) {
                     LOGI("close sock due to %s port reuse disabled", protocol == IPPROTO_TCP ? "tcp" : "udp");
                 }
@@ -411,7 +438,7 @@ create_and_bind(const char *host, const char *port, int protocol)
         return -1;
     }
 
-    return is_port_reuse ? listen_sock : -2;
+    return is_reuse_port ? listen_sock : -2;
 }
 
 static void
@@ -440,7 +467,7 @@ static void
 get_and_release_sock_lock(char *port)
 {
     if (verbose) {
-        LOGI("try to get and release sock lock at port: %s", port);
+        LOGI("try to release sock lock at port: %s", port);
     }
 
     sock_lock_t *sock_lock = NULL;
@@ -632,6 +659,7 @@ remove_server(char *prefix, char *port)
     cork_hash_table_delete(server_table, (void *)port, (void **)&old_port, (void **)&old_server);
 
     if (old_server != NULL) {
+        destroy_server(old_server);
         ss_free(old_server);
     }
 
@@ -641,6 +669,9 @@ remove_server(char *prefix, char *port)
 static void
 update_stat(char *port, uint64_t traffic)
 {
+    if (verbose) {
+        LOGI("update traffic %" PRIu64 " for port %s", traffic, port);
+    }
     void *ret = cork_hash_table_get(server_table, (void *)port);
     if (ret != NULL) {
         struct server *server = (struct server *)ret;
@@ -653,7 +684,7 @@ manager_recv_cb(EV_P_ ev_io *w, int revents)
 {
     struct manager_ctx *manager = (struct manager_ctx *)w;
     socklen_t len;
-    size_t r;
+    ssize_t r;
     struct sockaddr_un claddr;
     char buf[BUF_SIZE];
 
@@ -682,6 +713,7 @@ manager_recv_cb(EV_P_ ev_io *w, int revents)
         if (server == NULL || server->port[0] == 0 || server->password[0] == 0) {
             LOGE("invalid command: %s:%s", buf, get_data(buf, r));
             if (server != NULL) {
+                destroy_server(server);
                 ss_free(server);
             }
             goto ERROR_MSG;
@@ -710,12 +742,14 @@ manager_recv_cb(EV_P_ ev_io *w, int revents)
         if (server == NULL || server->port[0] == 0) {
             LOGE("invalid command: %s:%s", buf, get_data(buf, r));
             if (server != NULL) {
+                destroy_server(server);
                 ss_free(server);
             }
             goto ERROR_MSG;
         }
 
         remove_server(working_dir, server->port);
+        destroy_server(server);
         ss_free(server);
 
         char msg[3] = "ok";
@@ -886,11 +920,11 @@ main(int argc, char **argv)
     char *plugin          = NULL;
     char *plugin_opts     = NULL;
 
-    int auth      = 0;
-    int fast_open = 0;
-    int mode      = TCP_ONLY;
-    int mtu       = 0;
-    int ipv6first = 0;
+    int fast_open  = 0;
+    int reuse_port = 0;
+    int mode       = TCP_ONLY;
+    int mtu        = 0;
+    int ipv6first  = 0;
 
 #ifdef HAVE_SETRLIMIT
     static int nofile = 0;
@@ -904,17 +938,20 @@ main(int argc, char **argv)
 
     jconf_t *conf = NULL;
 
-    int option_index                    = 0;
     static struct option long_options[] = {
-        { "fast-open",       no_argument,       0, 0 },
-        { "acl",             required_argument, 0, 0 },
-        { "manager-address", required_argument, 0, 0 },
-        { "executable",      required_argument, 0, 0 },
-        { "mtu",             required_argument, 0, 0 },
-        { "plugin",          required_argument, 0, 0 },
-        { "plugin-opts",     required_argument, 0, 0 },
-        { "help",            no_argument,       0, 0 },
-        { 0,                 0,                 0, 0 }
+        { "fast-open",       no_argument,       NULL, GETOPT_VAL_FAST_OPEN },
+        { "reuse-port",      no_argument,       NULL, GETOPT_VAL_REUSE_PORT },
+        { "acl",             required_argument, NULL, GETOPT_VAL_ACL },
+        { "manager-address", required_argument, NULL,
+                                                GETOPT_VAL_MANAGER_ADDRESS },
+        { "executable",      required_argument, NULL,
+                                                GETOPT_VAL_EXECUTABLE },
+        { "mtu",             required_argument, NULL, GETOPT_VAL_MTU },
+        { "plugin",          required_argument, NULL, GETOPT_VAL_PLUGIN },
+        { "plugin-opts",     required_argument, NULL, GETOPT_VAL_PLUGIN_OPTS },
+        { "password",        required_argument, NULL, GETOPT_VAL_PASSWORD },
+        { "help",            no_argument,       NULL, GETOPT_VAL_HELP },
+        { NULL,              0,                 NULL, 0 }
     };
 
     opterr = 0;
@@ -922,33 +959,38 @@ main(int argc, char **argv)
     USE_TTY();
 
     while ((c = getopt_long(argc, argv, "f:s:l:k:t:m:c:i:d:a:n:6huUvA",
-                            long_options, &option_index)) != -1)
+                            long_options, NULL)) != -1)
         switch (c) {
-        case 0:
-            if (option_index == 0) {
-                fast_open = 1;
-            } else if (option_index == 1) {
-                acl = optarg;
-            } else if (option_index == 2) {
-                manager_address = optarg;
-            } else if (option_index == 3) {
-                executable = optarg;
-            } else if (option_index == 4) {
-                mtu = atoi(optarg);
-            } else if (option_index == 5) {
-                plugin = optarg;
-            } else if (option_index == 6) {
-                plugin_opts = optarg;
-            } else if (option_index == 7) {
-                usage();
-                exit(EXIT_SUCCESS);
-            }
+        case GETOPT_VAL_REUSE_PORT:
+            reuse_port = 1;
+            break;
+        case GETOPT_VAL_FAST_OPEN:
+            fast_open = 1;
+            break;
+        case GETOPT_VAL_ACL:
+            acl = optarg;
+            break;
+        case GETOPT_VAL_MANAGER_ADDRESS:
+            manager_address = optarg;
+            break;
+        case GETOPT_VAL_EXECUTABLE:
+            executable = optarg;
+            break;
+        case GETOPT_VAL_MTU:
+            mtu = atoi(optarg);
+            break;
+        case GETOPT_VAL_PLUGIN:
+            plugin = optarg;
+            break;
+        case GETOPT_VAL_PLUGIN_OPTS:
+            plugin_opts = optarg;
             break;
         case 's':
             if (server_num < MAX_REMOTE_NUM) {
                 server_host[server_num++] = optarg;
             }
             break;
+        case GETOPT_VAL_PASSWORD:
         case 'k':
             password = optarg;
             break;
@@ -988,17 +1030,18 @@ main(int argc, char **argv)
         case 'v':
             verbose = 1;
             break;
+        case GETOPT_VAL_HELP:
         case 'h':
             usage();
             exit(EXIT_SUCCESS);
-        case 'A':
-            auth = 1;
-            break;
 #ifdef HAVE_SETRLIMIT
         case 'n':
             nofile = atoi(optarg);
             break;
 #endif
+        case 'A':
+            FATAL("One time auth has been deprecated. Try AEAD ciphers instead.");
+            break;
         case '?':
             // The option character is not recognized.
             LOGE("Unrecognized option: %s", optarg);
@@ -1030,16 +1073,14 @@ main(int argc, char **argv)
         if (user == NULL) {
             user = conf->user;
         }
-#ifdef TCP_FASTOPEN
         if (fast_open == 0) {
             fast_open = conf->fast_open;
         }
-#endif
+        if (reuse_port == 0) {
+            reuse_port = conf->reuse_port;
+        }
         if (conf->nameserver != NULL) {
             nameservers[nameserver_num++] = conf->nameserver;
-        }
-        if (auth == 0) {
-            auth = conf->auth;
         }
         if (mode == TCP_ONLY) {
             mode = conf->mode;
@@ -1080,6 +1121,11 @@ main(int argc, char **argv)
         daemonize(pid_path);
     }
 
+    if (manager_address == NULL) {
+        manager_address = "127.0.0.1:8839";
+        LOGI("using the default manager address: %s", manager_address);
+    }
+
     if (server_num == 0 || manager_address == NULL) {
         usage();
         exit(EXIT_FAILURE);
@@ -1093,18 +1139,10 @@ main(int argc, char **argv)
 #endif
     }
 
-    if (auth) {
-        LOGI("onetime authentication enabled");
-    }
-
-#ifdef __MINGW32__
-    winsock_init();
-#else
     // ignore SIGPIPE
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
     signal(SIGABRT, SIG_IGN);
-#endif
 
     struct ev_signal sigint_watcher;
     struct ev_signal sigterm_watcher;
@@ -1116,10 +1154,10 @@ main(int argc, char **argv)
     struct manager_ctx manager;
     memset(&manager, 0, sizeof(struct manager_ctx));
 
+    manager.reuse_port      = reuse_port;
     manager.fast_open       = fast_open;
     manager.verbose         = verbose;
     manager.mode            = mode;
-    manager.auth            = auth;
     manager.password        = password;
     manager.timeout         = timeout;
     manager.method          = method;
@@ -1147,11 +1185,9 @@ main(int argc, char **argv)
         FATAL("failed to switch user");
     }
 
-#ifndef __MINGW32__
     if (geteuid() == 0) {
         LOGI("running from root user");
     }
-#endif
 
     struct passwd *pw   = getpwuid(getuid());
     const char *homedir = pw->pw_dir;
@@ -1264,10 +1300,6 @@ main(int argc, char **argv)
         sock_lock_t *sock_lock = (sock_lock_t *)entry->value;
         release_sock_lock(sock_lock);
     }
-
-#ifdef __MINGW32__
-    winsock_cleanup();
-#endif
 
     ev_signal_stop(EV_DEFAULT, &sigint_watcher);
     ev_signal_stop(EV_DEFAULT, &sigterm_watcher);
